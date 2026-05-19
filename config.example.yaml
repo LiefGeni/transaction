@@ -1,0 +1,31 @@
+report:
+  title_prefix: "A股日报"
+  top_n_candidates: 5
+  top_n_sectors: 8
+  top_n_risks: 5
+
+filters:
+  min_price: 3
+  max_price: 120
+  min_turnover_rate: 1
+  max_turnover_rate: 25
+  min_market_cap_cny: 3000000000
+  exclude_name_keywords:
+    - ST
+    - 退
+    - N
+    - C
+
+strategy:
+  sector_flow_weight: 0.35
+  stock_flow_weight: 0.3
+  momentum_weight: 0.2
+  liquidity_weight: 0.15
+  avoid_limit_up_open: true
+
+holdings: []
+# Example:
+# holdings:
+#   - code: "600519"
+#     name: "贵州茅台"
+#     cost: 1600
