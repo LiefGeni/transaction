@@ -29,6 +29,7 @@ os.environ.pop("SSLKEYLOGFILE", None)
 class ReportConfig:
     title_prefix: str = "A股日报"
     top_n_candidates: int = 5
+    top_n_intraday: int = 5
     top_n_sectors: int = 8
     top_n_risks: int = 5
     min_price: float = 3
@@ -37,6 +38,7 @@ class ReportConfig:
     max_turnover_rate: float = 25
     min_market_cap_cny: float = 3_000_000_000
     exclude_name_keywords: list[str] = field(default_factory=lambda: ["ST", "退", "N", "C"])
+    holdings: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_env() -> None:
@@ -65,6 +67,7 @@ def load_config() -> ReportConfig:
         filters = data.get("filters", {})
         cfg.title_prefix = report.get("title_prefix", cfg.title_prefix)
         cfg.top_n_candidates = int(report.get("top_n_candidates", cfg.top_n_candidates))
+        cfg.top_n_intraday = int(report.get("top_n_intraday", cfg.top_n_intraday))
         cfg.top_n_sectors = int(report.get("top_n_sectors", cfg.top_n_sectors))
         cfg.top_n_risks = int(report.get("top_n_risks", cfg.top_n_risks))
         cfg.min_price = float(filters.get("min_price", cfg.min_price))
@@ -73,6 +76,7 @@ def load_config() -> ReportConfig:
         cfg.max_turnover_rate = float(filters.get("max_turnover_rate", cfg.max_turnover_rate))
         cfg.min_market_cap_cny = float(filters.get("min_market_cap_cny", cfg.min_market_cap_cny))
         cfg.exclude_name_keywords = list(filters.get("exclude_name_keywords", cfg.exclude_name_keywords))
+        cfg.holdings = list(data.get("holdings", cfg.holdings) or [])
     except Exception:
         pass
     return cfg
@@ -113,6 +117,10 @@ def num(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
 
 
 def percentile_scores(rows: list[dict[str, Any]], key: str, inverse: bool = False) -> dict[int, float]:
@@ -321,8 +329,7 @@ def top_sector_names(data: dict[str, Any], cfg: ReportConfig) -> set[str]:
     return {str(row.get("名称")) for row in ranked[: cfg.top_n_sectors]}
 
 
-def score_candidates(data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, Any]]:
-    rows = filtered_universe(data["spot"], cfg)
+def enrich_buy_scores(rows: list[dict[str, Any]], data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, Any]]:
     if not rows:
         return []
     flow_score = percentile_scores(rows, "主力净占比")
@@ -330,17 +337,48 @@ def score_candidates(data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, 
     liquidity_score = percentile_scores(rows, "成交额")
     hot_names = top_sector_names(data, cfg)
     for idx, row in enumerate(rows):
+        change = num(row.get("涨跌幅"))
+        turnover = num(row.get("换手率"))
+        flow_pct = num(row.get("主力净占比"))
         sector_score = 0.0
         text = f"{row.get('名称', '')} {row.get('代码', '')}"
-        # Eastmoney stock list does not always expose sector here; use flow/momentum when sector match is absent.
+        # Eastmoney stock list does not always expose sector here; this is a light bonus only.
         if any(name and name in text for name in hot_names):
             sector_score = 1.0
-        change = num(row.get("涨跌幅"))
-        if change >= 9.5:
-            row["_score"] = -1
-            continue
-        row["_score"] = flow_score[idx] * 0.4 + momentum_score[idx] * 0.25 + liquidity_score[idx] * 0.25 + sector_score * 0.1
+
+        turnover_quality = clamp(1 - abs(turnover - 8) / 12)
+        chase_penalty = clamp((change - 7) / 3) * 0.22 if change > 7 else 0
+        weak_flow_penalty = 0.18 if flow_pct < 0 else 0
+        loss_penalty = 0.12 if change < 0 else 0
+        risk_penalty = chase_penalty + weak_flow_penalty + loss_penalty
+
+        buy_score = (
+            flow_score[idx] * 0.36
+            + momentum_score[idx] * 0.22
+            + liquidity_score[idx] * 0.18
+            + turnover_quality * 0.16
+            + sector_score * 0.08
+            - risk_penalty
+        )
+        buy_score = clamp(buy_score)
+        row["_score"] = buy_score
+        row["_profit_score"] = round(buy_score * 100, 1)
+        row["_expected_return"] = round((buy_score - 0.5) * 12 - risk_penalty * 8, 2)
+        row["_risk_level"] = risk_label(row, risk_penalty)
+        row["_buy_value"] = buy_value_label(buy_score, row)
         row["_reason"] = explain_candidate(row)
+    return rows
+
+
+def score_candidates(data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, Any]]:
+    rows = filtered_universe(data["spot"], cfg)
+    if not rows:
+        return []
+    enrich_buy_scores(rows, data, cfg)
+    for row in rows:
+        if num(row.get("涨跌幅")) >= 9.5:
+            row["_score"] = -1
+            row["_buy_value"] = "不追高"
     return sorted(rows, key=lambda row: row.get("_score", 0), reverse=True)[: cfg.top_n_candidates]
 
 
@@ -351,6 +389,64 @@ def score_risks(data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, Any]]
     for idx, row in enumerate(rows):
         row["_risk_score"] = risk_score[idx] * 0.75 + turnover_score[idx] * 0.25
     return sorted(rows, key=lambda row: row.get("_risk_score", 0), reverse=True)[: cfg.top_n_risks]
+
+
+def score_sell_signals(data: dict[str, Any], cfg: ReportConfig) -> list[dict[str, Any]]:
+    rows = filtered_universe(data["spot"], cfg)
+    if not rows:
+        return []
+    holding_codes = {str(item.get("code") or item.get("代码") or "") for item in cfg.holdings}
+    if holding_codes:
+        focused = [row for row in rows if str(row.get("代码") or "") in holding_codes]
+        rows = focused or rows
+    weak_flow_score = percentile_scores(rows, "主力净占比", inverse=True)
+    loss_score = percentile_scores(rows, "涨跌幅", inverse=True)
+    turnover_score = percentile_scores(rows, "换手率")
+    for idx, row in enumerate(rows):
+        change = num(row.get("涨跌幅"))
+        flow_pct = num(row.get("主力净占比"))
+        hard_stop = 0.18 if change <= -5 else 0
+        weak_flow = 0.12 if flow_pct < -5 else 0
+        row["_sell_score"] = clamp(
+            weak_flow_score[idx] * 0.36 + loss_score[idx] * 0.32 + turnover_score[idx] * 0.2 + hard_stop + weak_flow
+        )
+        row["_sell_rank_score"] = round(row["_sell_score"] * 100, 1)
+        row["_sell_action"] = sell_action_label(row)
+        row["_sell_reason"] = explain_sell_signal(row)
+    return sorted(rows, key=lambda row: row.get("_sell_score", 0), reverse=True)[: cfg.top_n_intraday]
+
+
+def buy_value_label(score: float, row: dict[str, Any]) -> str:
+    if num(row.get("涨跌幅")) >= 9.5:
+        return "不追高"
+    if score >= 0.78:
+        return "强观察"
+    if score >= 0.65:
+        return "可小仓观察"
+    if score >= 0.52:
+        return "等待回踩"
+    return "暂不买"
+
+
+def risk_label(row: dict[str, Any], penalty: float) -> str:
+    if num(row.get("涨跌幅")) >= 8.5 or num(row.get("换手率")) >= 20 or penalty >= 0.25:
+        return "高"
+    if num(row.get("涨跌幅")) >= 5.5 or num(row.get("换手率")) >= 14 or penalty >= 0.12:
+        return "中"
+    return "低"
+
+
+def sell_action_label(row: dict[str, Any]) -> str:
+    score = num(row.get("_sell_score"))
+    change = num(row.get("涨跌幅"))
+    flow_pct = num(row.get("主力净占比"))
+    if change <= -7 or (score >= 0.82 and flow_pct < 0):
+        return "卖出观察"
+    if score >= 0.65:
+        return "减仓观察"
+    if score >= 0.5:
+        return "设止损观察"
+    return "继续观察"
 
 
 def explain_candidate(row: dict[str, Any]) -> str:
@@ -364,6 +460,19 @@ def explain_candidate(row: dict[str, Any]) -> str:
     if 3 <= num(row.get("换手率")) <= 15:
         parts.append("换手充分")
     return "，".join(parts) or "综合资金、动量和流动性评分靠前"
+
+
+def explain_sell_signal(row: dict[str, Any]) -> str:
+    parts = []
+    if num(row.get("主力净占比")) < -5:
+        parts.append("主力净流出明显")
+    if num(row.get("涨跌幅")) < -3:
+        parts.append("盘中走弱")
+    if num(row.get("换手率")) > 15:
+        parts.append("高换手波动")
+    if num(row.get("成交额")) > 800_000_000 and num(row.get("涨跌幅")) < 0:
+        parts.append("放量下跌")
+    return "，".join(parts) or "风险评分靠前"
 
 
 def money(value: Any) -> str:
@@ -401,8 +510,10 @@ def count_by(rows: list[dict[str, Any]], key: str, limit: int = 5) -> str:
 
 def render_report(mode: str, data: dict[str, Any], cfg: ReportConfig) -> tuple[str, str]:
     generated = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    title = f"{cfg.title_prefix} {data['date']} {'开盘前' if mode == 'morning' else '收盘后'}"
+    mode_label = {"morning": "开盘前", "intraday": "盘中", "close": "收盘后"}[mode]
+    title = f"{cfg.title_prefix} {data['date']} {mode_label}"
     candidates = score_candidates(data, cfg)
+    sell_signals = score_sell_signals(data, cfg)
     risks = score_risks(data, cfg)
     lines = [
         f"# {title}",
@@ -425,12 +536,13 @@ def render_report(mode: str, data: dict[str, Any], cfg: ReportConfig) -> tuple[s
     lines.extend(["", "## 概念资金流入", ""])
     lines.extend(table_lines(data["concept_flow"], ["名称", "今日涨跌幅", "主力净流入", "主力净占比"], cfg.top_n_sectors))
     if mode == "morning":
-        lines.extend(["", "## 5 只观察候选", ""])
+        lines.extend(["", "## 5 只观察候选（按盈利评分排序）", ""])
         if candidates:
-            for row in candidates:
+            for rank, row in enumerate(candidates, 1):
                 lines.append(
-                    f"- {row.get('代码')} {row.get('名称')} | 涨跌幅:{row.get('涨跌幅')} | "
-                    f"换手率:{row.get('换手率')} | 主力净占比:{row.get('主力净占比')} | 逻辑:{row.get('_reason')}"
+                    f"- #{rank} {row.get('代码')} {row.get('名称')} | 盈利评分:{row.get('_profit_score')} | "
+                    f"预期收益:{row.get('_expected_return')}% | 买入价值:{row.get('_buy_value')} | 风险:{row.get('_risk_level')} | "
+                    f"涨跌幅:{row.get('涨跌幅')} | 换手率:{row.get('换手率')} | 主力净占比:{row.get('主力净占比')} | 逻辑:{row.get('_reason')}"
                 )
         else:
             lines.append("暂无候选：实时行情或资金流数据不可用。")
@@ -441,6 +553,36 @@ def render_report(mode: str, data: dict[str, Any], cfg: ReportConfig) -> tuple[s
                 "",
                 "- 持仓股若跌破个人止损线、放量下跌、主力净流出扩大，优先降低仓位。",
                 "- 一字涨停、连续加速后放量开板、跌停封单扩大，不纳入追高买入。",
+            ]
+        )
+    elif mode == "intraday":
+        lines.extend(["", "## 盘中买入观察排行", ""])
+        if candidates:
+            for rank, row in enumerate(candidates[: cfg.top_n_intraday], 1):
+                lines.append(
+                    f"- #{rank} {row.get('代码')} {row.get('名称')} | 盈利评分:{row.get('_profit_score')} | "
+                    f"预期收益:{row.get('_expected_return')}% | 买入价值:{row.get('_buy_value')} | 风险:{row.get('_risk_level')} | "
+                    f"涨跌幅:{row.get('涨跌幅')} | 换手率:{row.get('换手率')} | 主力净占比:{row.get('主力净占比')} | 逻辑:{row.get('_reason')}"
+                )
+        else:
+            lines.append("暂无买入观察：实时行情或资金流数据不可用。")
+        lines.extend(["", "## 盘中卖出/减仓观察排行", ""])
+        if sell_signals:
+            for rank, row in enumerate(sell_signals, 1):
+                lines.append(
+                    f"- #{rank} {row.get('代码')} {row.get('名称')} | 风险评分:{row.get('_sell_rank_score')} | "
+                    f"动作:{row.get('_sell_action')} | 涨跌幅:{row.get('涨跌幅')} | 换手率:{row.get('换手率')} | "
+                    f"主力净占比:{row.get('主力净占比')} | 原因:{row.get('_sell_reason')}"
+                )
+        else:
+            lines.append("暂无卖出观察：实时行情或资金流数据不可用。")
+        lines.extend(
+            [
+                "",
+                "## 盘中执行纪律",
+                "",
+                "- 买入观察只在流动性充足、未涨停、未明显冲高回落时考虑；评分越高代表当前胜率条件越集中。",
+                "- 卖出观察优先处理持仓股；若未在 `config.yaml` 填持仓，则展示全市场风险信号。",
             ]
         )
     else:
@@ -488,7 +630,7 @@ def save_report(title: str, body: str, mode: str, date_str: str) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate A-share morning or close report.")
-    parser.add_argument("--mode", choices=["morning", "close"], required=True)
+    parser.add_argument("--mode", choices=["morning", "intraday", "close"], required=True)
     parser.add_argument("--date", default=today_yyyymmdd(), help="YYYYMMDD, defaults to today in Asia/Shanghai.")
     parser.add_argument("--push", action="store_true", help="Push to configured WeChat-compatible channels.")
     args = parser.parse_args()

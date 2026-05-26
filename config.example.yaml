@@ -1,6 +1,7 @@
 report:
   title_prefix: "A股日报"
   top_n_candidates: 5
+  top_n_intraday: 5
   top_n_sectors: 8
   top_n_risks: 5
 
